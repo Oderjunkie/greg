@@ -1,5 +1,6 @@
 #ifndef GREG
 #define GREG
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -8,6 +9,7 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <string.h>
+#include <time.h>
 
 struct _rect { int x, y, w, h; };
 enum _split_type { _HSPLIT, _VSPLIT };
@@ -28,6 +30,8 @@ static FILE **logs = NULL;
   _with( \
     memset(&_rects, 0x00, sizeof(_rects)), \
     memset(&_pids, 0x00, sizeof(_pids)), \
+    printf("\x1b[2J\x1b[0;0H"), \
+    fflush(stdout), \
     _max = _parse_split(_get_terminal_dimensions(), &_rects, option, stringized) \
   ) \
   _split1
@@ -62,18 +66,32 @@ static inline void _wait_for_children_to_die(pid_t *pids) {
 static inline void _hijack_child(pid_t pid, struct _rect rect) {
   int left_ptr = rect.x, up_ptr = rect.y;
   int status;
-  pid = waitpid(-1, &status, 0);
-  ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACEFORK);
+  int id;
+  id = getpid();
+  waitpid(pid, &status, 0);
+  // ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACEFORK);
   ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+  fprintf(*logs, "*_hijack_child %d hooked onto pid #%d*\n", id, pid);
   while ((pid = waitpid(-1, &status, 0)) && !WIFEXITED(status)) {
     struct user_regs_struct regs;
     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+    // if (status >> 16 == PTRACE_EVENT_FORK) {
+    //   int newpid;
+    //   ptrace(PTRACE_GETEVENTMSG, pid, NULL, (long) &newpid);
+    //   fprintf(*logs, "[_hijack_child %d] fork detected from %d to %d\n", id, pid, newpid);
+    //   waitpid(newpid, &status, 0);
+    //   ptrace(PTRACE_SETOPTIONS, newpid, NULL, PTRACE_O_TRACEFORK);
+    //   ptrace(PTRACE_SYSCALL, newpid, NULL, NULL);
+    //   fprintf(*logs, "[_hijack_child %d] subsequently hooked\n", id);
+    // }
     if (regs.orig_rax == 1 && regs.rdi == 1) { // write(stdout, ..., ...)
       const char *buf = (const char *) regs.rsi;
       size_t count = (size_t) regs.rdx;
-      
+      char *translated_buf = malloc(count);
+      for (size_t i = 0; i < count; i++)
+        translated_buf[i] = ptrace(PTRACE_PEEKDATA, pid, &buf[i], NULL);
       for (size_t i = 0; i < count; i++) {
-        char c = ptrace(PTRACE_PEEKDATA, pid, &buf[i], NULL);
+        char c = translated_buf[i];
         if (c == '\x1b') {
           char escape[64];
           int escapei = 0;
@@ -81,8 +99,8 @@ static inline void _hijack_child(pid_t pid, struct _rect rect) {
           c = '0';
           while (c >= '0' && c <= '9' || c == ';') {
             i++;
-            c = ptrace(PTRACE_PEEKDATA, pid, &buf[i], NULL);
-            escape[escapei++] = c;
+            c = translated_buf[i];
+            escape[escapei++] = translated_buf[i];
           }
           escape[escapei] = '\0';
           escapei = 0;
@@ -178,7 +196,7 @@ static inline void _hijack_child(pid_t pid, struct _rect rect) {
               break;
             }
             default: {
-              fflush(stdout), printf("\x1b[%s", escape), fflush(stdout);
+              printf("\x1b[%s", escape), fflush(stdout);
             }
           }
         } else if (c == '\n') {
@@ -187,7 +205,7 @@ static inline void _hijack_child(pid_t pid, struct _rect rect) {
           if (up_ptr >= rect.y + rect.h)
             fprintf(stderr, "error: ran out of buffer space (scrolling not supported yet)\n"), exit(EXIT_FAILURE);
         } else {
-          fflush(stdout), printf("\x1b[%d;%dH%c\n", up_ptr + 1, left_ptr + 1, c), fflush(stdout);
+          printf("\x1b[%d;%dH%c", up_ptr + 1, left_ptr + 1, c), fflush(stdout);
           left_ptr++;
           if (left_ptr >= rect.x + rect.w) {
             left_ptr = rect.x;
@@ -197,7 +215,8 @@ static inline void _hijack_child(pid_t pid, struct _rect rect) {
           }
         }
       }
-      
+      free(translated_buf);
+      fprintf(*logs, "[_hijack_child %d] intercepted syscall to write \"%*s\".\n", id, count, translated_buf);
       regs.orig_rax = -1;
       ptrace(PTRACE_SETREGS, pid, NULL, &regs);
       ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
@@ -218,6 +237,11 @@ static inline void _hijack_child(pid_t pid, struct _rect rect) {
     }
     ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
   }
+  fprintf(*logs, "*_hijack_child %d ended*\n", id);
+}
+
+static void _foo(void) {
+  fclose(*logs);
 }
 
 static inline struct _rect _get_terminal_dimensions(void) {
@@ -225,7 +249,9 @@ static inline struct _rect _get_terminal_dimensions(void) {
   struct winsize w;
   if (!logs) {
     logs = mmap(NULL, sizeof(FILE *), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
-    *logs = fopen("/tmp/greg.log", "a");
+    *logs = fopen("/tmp/greg.log", "w");
+    atexit(_foo);
+    signal(SIGINT, _foo);
   }
   ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
   current_window.x = 0;
